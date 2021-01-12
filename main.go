@@ -12,13 +12,11 @@ import (
 	sqle "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/analyzer"
-	"github.com/dolthub/go-mysql-server/sql/information_schema"
 	"github.com/olekukonko/tablewriter"
 )
 
 func main() {
 	catalog := sql.NewCatalog()
-	catalog.AddDatabase(information_schema.NewInformationSchemaDatabase(catalog))
 
 	db, err := NewImmuDatabase()
 	if err != nil {

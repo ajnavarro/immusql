@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 
 	"github.com/codenotary/immudb/pkg/api/schema"
@@ -22,7 +23,7 @@ const tableDataPrefixKey = "td/%s/%s"
 // td/database_name/table_name/row_primary_key
 const tableDataKey = tableDataPrefixKey + "/%d"
 
-// dbm/table_name
+// dbm/db_name
 const databaseMetadataKey = "dbm/%s"
 
 type Storage struct {
@@ -33,6 +34,10 @@ func (s *Storage) getTableMetadataKey(dbName, tableName string) []byte {
 	return []byte(fmt.Sprintf(tableMetadataKey, strings.ToLower(dbName), strings.ToLower(tableName)))
 }
 
+func (s *Storage) getTableDataPrefixKey(dbName, tableName string) []byte {
+	return []byte(fmt.Sprintf(tableDataPrefixKey, strings.ToLower(dbName), strings.ToLower(tableName)))
+}
+
 func (s *Storage) getTableDataKey(dbName, tableName string, primaryKey int64) []byte {
 	return []byte(fmt.Sprintf(tableDataKey, strings.ToLower(dbName), strings.ToLower(tableName), primaryKey))
 }
@@ -41,7 +46,7 @@ func (s *Storage) getDbMetadataKey(dbName string) []byte {
 	return []byte(fmt.Sprintf(strings.ToLower(databaseMetadataKey), dbName))
 }
 
-func (s *Storage) CreateTable(ctx context.Context, tblName, dbName string, sch sql.Schema) error {
+func (s *Storage) CreateTable(ctx context.Context, tblName, dbName string, sch sql.Schema) (uint64, error) {
 	// we need a primary key to make all storage logic easier
 	pkFound := false
 	for _, c := range sch {
@@ -52,17 +57,17 @@ func (s *Storage) CreateTable(ctx context.Context, tblName, dbName string, sch s
 	}
 
 	if !pkFound {
-		return fmt.Errorf("PK not found")
+		return 0, fmt.Errorf("PK not found")
 	}
 
-	tables, err := s.GetTables(ctx, dbName)
+	tables, err := s.GetTables(ctx, 0, dbName)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	for _, t := range tables {
 		if t == strings.ToLower(tblName) {
-			return sql.ErrTableAlreadyExists.New(tblName)
+			return 0, sql.ErrTableAlreadyExists.New(tblName)
 		}
 	}
 
@@ -70,12 +75,12 @@ func (s *Storage) CreateTable(ctx context.Context, tblName, dbName string, sch s
 
 	tablesVal, err := json.Marshal(&tables)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	schemaVal, err := json.Marshal(NewSchema(sch))
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// TODO: docu is wrong, it says that this is called KVList instead of SetRequest...
@@ -84,35 +89,56 @@ func (s *Storage) CreateTable(ctx context.Context, tblName, dbName string, sch s
 		{Key: s.getTableMetadataKey(dbName, tblName), Value: schemaVal},
 	}}
 
-	_, err = s.c.SetAll(s.withLogin(ctx), kvList)
-	return err
+	tx, err := s.c.SetAll(s.withLogin(ctx), kvList)
+	if err != nil {
+		return 0, err
+	}
+
+	return tx.Id, nil
 }
 
-func (s *Storage) InsertRows(ctx context.Context, dbName, tblName string, pkindex int, rows []sql.Row) error {
+func (s *Storage) InsertRows(ctx context.Context, dbName, tblName string, pkindex int, rows []sql.Row) (uint64, error) {
 	var kvs []*schema.KeyValue
 	for _, r := range rows {
 		rr, err := json.Marshal(r)
 		if err != nil {
-			return err
+			return 0, err
 		}
 
-		// TODO: ugly type assertion to move fast
-		kvs = append(kvs, &schema.KeyValue{Key: s.getTableDataKey(dbName, tblName, r[pkindex].(int64)), Value: rr})
+		kvs = append(kvs,
+			&schema.KeyValue{
+				Key: s.getTableDataKey(
+					dbName,
+					tblName,
+					r[pkindex].(int64), /*TODO: ugly type assertion to move fast*/
+				),
+				Value: rr,
+			})
 	}
 
-	_, err := s.c.SetAll(s.withLogin(ctx), &schema.SetRequest{KVs: kvs})
-	return err
+	tx, err := s.c.SetAll(s.withLogin(ctx), &schema.SetRequest{KVs: kvs})
+	if err != nil {
+		return 0, err
+	}
+
+	return tx.Id, nil
 }
 
-// TODO: returning all rows at once. Immudb Scan method should return an interator if possible.
-// We can return batches using the offset I guess, but too complicated for that demo.
-func (s *Storage) GetRows(ctx context.Context, dbName, tblName string) ([]sql.Row, error) {
+func (s *Storage) GetRows(ctx context.Context, tx uint64, dbName, tblName string) ([]sql.Row, error) {
+	// TODO: returning all rows at once. Immudb Scan method should return an iterator if possible.
+	// We can return batches using the offset I guess, but too complicated for that demo.
+
+	if tx == 0 {
+		tx = math.MaxUint64
+	}
+
 	scanReq := &schema.ScanRequest{
 		SeekKey: nil,
-		Prefix:  []byte(tableDataPrefixKey),
+		Prefix:  []byte(s.getTableDataPrefixKey(dbName, tblName)),
 		Desc:    false,
 		Limit:   0,
-		SinceTx: 0,
+		SinceTx: tx,
+		NoWait:  true,
 	}
 
 	entries, err := s.c.Scan(s.withLogin(ctx), scanReq)
@@ -138,17 +164,21 @@ func (s *Storage) GetRows(ctx context.Context, dbName, tblName string) ([]sql.Ro
 	return rows, nil
 }
 
-func (s *Storage) GetSchema(ctx context.Context, dbName, tblName string) (sql.Schema, error) {
-	entry, err := s.c.Get(s.withLogin(ctx), s.getTableMetadataKey(dbName, tblName))
+func (s *Storage) GetSchema(ctx context.Context, tx uint64, dbName, tblName string) (sql.Schema, error) {
+	entry, err := s.c.GetSince(s.withLogin(ctx), s.getTableMetadataKey(dbName, tblName), tx)
 	if err != nil {
+		// TODO: SUPER UGLY. I didn't find possible error types to compare
+		if strings.Contains(err.Error(), "key not found") {
+			return nil, sql.ErrTableNotFound.New(tblName)
+		}
 		return nil, err
 	}
 
 	return SchemaFromData(entry.Value)
 }
 
-func (s *Storage) GetTables(ctx context.Context, dbName string) ([]string, error) {
-	entry, err := s.c.Get(s.withLogin(ctx), s.getDbMetadataKey(dbName))
+func (s *Storage) GetTables(ctx context.Context, tx uint64, dbName string) ([]string, error) {
+	entry, err := s.c.GetSince(s.withLogin(ctx), s.getDbMetadataKey(dbName), tx)
 	if err != nil {
 		// TODO: SUPER UGLY. I didn't find possible error types to compare
 		if strings.Contains(err.Error(), "key not found") {

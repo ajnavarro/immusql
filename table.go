@@ -15,6 +15,7 @@ type ImmuTable struct {
 	s       *Storage
 	name    string
 	dbName  string
+	txID    uint64
 	schema  sql.Schema
 	pkIndex int
 }
@@ -49,20 +50,12 @@ func (it *ImmuTable) Partitions(*sql.Context) (sql.PartitionIter, error) {
 }
 
 func (it *ImmuTable) PartitionRows(ctx *sql.Context, p sql.Partition) (sql.RowIter, error) {
-	// TODO: scan command appears to be broken
+	rows, err := it.s.GetRows(ctx, it.txID, it.dbName, it.name)
+	if err != nil {
+		return nil, err
+	}
 
-	// rows, err := it.s.GetRows(ctx, it.dbName, it.name)
-	// if err != nil {
-	// 	return nil, err
-	// }
-
-	// return sql.RowsToRowIter(rows...), nil
-
-	return sql.RowsToRowIter(
-		sql.Row{0, "example text 0", nil},
-		sql.Row{1, "example text 1", nil},
-		sql.Row{2, "example text 2", nil},
-	), nil
+	return sql.RowsToRowIter(rows...), nil
 }
 
 var _ sql.RowInserter = &ImmuRowInserter{}
@@ -82,7 +75,7 @@ func (iri *ImmuRowInserter) Insert(ctx *sql.Context, row sql.Row) error {
 }
 
 func (iri *ImmuRowInserter) Close(ctx *sql.Context) error {
-	err := iri.s.InsertRows(ctx, iri.dbName, iri.tName, iri.pkIndex, iri.rows)
+	_, err := iri.s.InsertRows(ctx, iri.dbName, iri.tName, iri.pkIndex, iri.rows)
 	iri.rows = nil
 	return err
 }
